@@ -1,277 +1,415 @@
+"""
+SINDy (Sparse Identification of Nonlinear Dynamics) pipeline
+===========================================================
+
+This script reads seismic‐related features from an Excel file, builds a custom
+function library, and uses Sequential Threshold Ridge Regression (STRidge) to
+identify a parsimonious analytical expression for log(Dn).
+
+Author  : ChensuChina
+Date    : 2025-07-21
+"""
+
 import numpy as np
 import time
 import pandas as pd
-from sklearn.metrics import mean_squared_error
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
-from sympy import sympify, symbols, evaluate
+from sympy import sympify, symbols
 from scipy.stats import pearsonr
 import os
-from sklearn.metrics import r2_score
+
+# --------------------------------------------------------------------------- #
+#                               STRidge helpers                               #
+# --------------------------------------------------------------------------- #
+
 def TrainSTRidge(R, Ut, lam, d_tol, maxit, STR_iters=10,
                  l0_penalty=None, normalize=2, split=0.8, print_best_tol=True):
-    np.random.seed(0)  # for consistancy
+    """
+    Train STRidge by an adaptive tolerance search.
+
+    Parameters
+    ----------
+    R : ndarray, shape (n_samples, n_features)
+        Library matrix.
+    Ut : ndarray, shape (n_samples, 1)
+        Target vector.
+    lam : float
+        Ridge penalty.
+    d_tol : float
+        Initial tolerance increment.
+    maxit : int
+        Maximum number of tolerance updates.
+    STR_iters : int, optional
+        Maximum inner STRidge iterations.
+    l0_penalty : float, optional
+        Penalisation weight for the number of non-zero coefficients.
+    normalize : int, optional
+        Normalisation order for each column (0 = none, 2 = L2).
+    split : float, optional
+        Fraction of data used for training.
+    print_best_tol : bool, optional
+        Whether to print the optimal tolerance.
+
+    Returns
+    -------
+    w_best : ndarray, shape (n_features, 1)
+        Final coefficient vector.
+    TrainR, TestR, TrainY, TestY : ndarray
+        Training / validation splits.
+    err_ : list
+        Validation errors during tolerance search.
+    tol_best : float
+        Optimal tolerance.
+    """
+    np.random.seed(0)
     n, _ = R.shape
     train = np.random.choice(n, int(n * split), replace=False)
     test = [i for i in np.arange(n) if i not in train]
+
     TrainR = R[train, :]
-    TestR = R[test, :]
+    TestR  = R[test, :]
     TrainY = Ut[train, :]
-    TestY = Ut[test, :]
+    TestY  = Ut[test, :]
     D = TrainR.shape[1]
 
-    # Set up the initial tolerance and l0 penalty
+    # Initial settings
     d_tol = float(d_tol)
-    tol = d_tol
-    # print(tol)
-    if l0_penalty == None: l0_penalty = 0.001 * np.linalg.cond(R)
+    tol   = d_tol
+    if l0_penalty is None:
+        l0_penalty = 0.001 * np.linalg.cond(R)
 
-    # Get the standard least squares estimator
+    # Least-squares baseline
     w = np.zeros((D, 1))
     w_best = np.linalg.lstsq(TrainR, TrainY, rcond=None)[0]
-    err_best = np.linalg.norm(TestY - TestR.dot(w_best), 2) + l0_penalty * np.count_nonzero(w_best)
+    err_best = np.linalg.norm(TestY - TestR.dot(w_best), 2) + \
+               l0_penalty * np.count_nonzero(w_best)
     tol_best = 0
     err_ = []
-    # Now increase tolerance until test performance decreases
+
+    # Adaptive tolerance loop
     for iter in range(maxit):
-        # Get a set of coefficients and error
         w = STRidge(TrainR, TrainY, lam, STR_iters, tol, normalize=normalize)
-        # print('stridge', w)
-        err1 = np.linalg.norm(TestR.dot(w), 2)
-        err_.append(err1)
-        err = np.linalg.norm(TestY - TestR.dot(w), 2) + l0_penalty * np.count_nonzero(w)
-        # Has the accuracy improved?
+        err = np.linalg.norm(TestY - TestR.dot(w), 2) + \
+              l0_penalty * np.count_nonzero(w)
+        err_.append(err)
+
         if err <= err_best:
             err_best = err
-            w_best = w
+            w_best   = w
             tol_best = tol
-            tol = tol + d_tol
-            # print('比较err：',tol)
-
+            tol += d_tol
         else:
             tol = max([0, tol - 2 * d_tol])
             d_tol = 2 * d_tol / (maxit - iter)
-            tol = tol + d_tol
-            # print('tol_max:', d_tol, tol)
+            tol += d_tol
             w_best = w
-
-    # if print_best_tol: print("Optimal tolerance:", tol_best)
 
     return w_best, TrainR, TestR, TrainY, TestY, err_, tol_best
 
-def STRidge(X0, y, lam, maxit, tol, normalize, sign_constraints = None, print_results=True):
-    """
-    Sequential Threshold Ridge Regression algorithm for finding (hopefully) sparse
-    approximation to X^{-1}y.  The idea is that this may do better with correlated observables.
 
-    This assumes y is only one column
+def STRidge(X0, y, lam, maxit, tol, normalize, sign_constraints=None,
+            print_results=True):
+    """
+    Sequential Threshold Ridge Regression.
+
+    Parameters
+    ----------
+    X0 : ndarray, shape (n_samples, n_features)
+        Input matrix.
+    y : ndarray, shape (n_samples, 1)
+        Target vector.
+    lam : float
+        Ridge penalty.
+    maxit : int
+        Maximum iterations.
+    tol : float
+        Absolute threshold for coefficient pruning.
+    normalize : {0, 2}
+        Normalisation order.
+    sign_constraints : dict, optional
+        Mapping {index: desired_sign} to enforce positive/negative coefficients.
+    print_results : bool, optional
+        Verbosity flag.
+
+    Returns
+    -------
+    w : ndarray, shape (n_features, 1)
+        Sparse coefficient vector.
     """
     n, d = X0.shape
     X = np.zeros((n, d), dtype=np.float32)
-    # First normalize data
+
+    # Column-wise normalisation
     if normalize != 0:
         Mreg = np.zeros((d, 1))
-        for i in range(0, d):
-            Mreg[i] = 1.0 / (np.linalg.norm(X0[:, i], normalize))
+        for i in range(d):
+            Mreg[i] = 1.0 / np.linalg.norm(X0[:, i], normalize)
             X[:, i] = Mreg[i] * X0[:, i]
     else:
         X = X0
 
-    # Get the standard ridge estimate
+    # Initial ridge solution
     if lam != 0:
-        w = np.linalg.lstsq(X.T.dot(X) + lam * np.eye(d), X.T.dot(y), rcond=None)[0]
+        w = np.linalg.lstsq(X.T @ X + lam * np.eye(d), X.T @ y, rcond=None)[0]
     else:
         w = np.linalg.lstsq(X, y, rcond=None)[0]
-    num_relevant = d
-    biginds = np.where(abs(w) > tol)[0]
 
-    # Threshold and continue
+    # Iterative hard thresholding
     for j in range(maxit):
-        # Figure out which items to cut out
-        smallinds = np.where(abs(w) < tol)[0]
-        # print('smallinds:', smallinds)
+        smallinds = np.where(np.abs(w) < tol)[0]
         new_biginds = [i for i in range(d) if i not in smallinds]
 
-        # If nothing changes then stop
-        if num_relevant == len(new_biginds):
-            break
-        else:
-            num_relevant = len(new_biginds)
-
-        # Also make sure we didn't just lose all the coefficients
         if len(new_biginds) == 0:
-            if j == 0:
-                # if print_results: print("Tolerance too high - all coefficients set below tolerance")
-                return w
-            else:
-                break
-        biginds = new_biginds
+            if j == 0 and print_results:
+                print("Tolerance too high – all coefficients below threshold")
+            break
 
-        # Otherwise get a new guess
+        if len(new_biginds) == len(np.where(np.abs(w) > tol)[0]):
+            break
+
+        biginds = new_biginds
         w[smallinds] = 0
+
+        # Re-fit on the active set
         if lam != 0:
-            w[biginds] = \
-                np.linalg.lstsq(X[:, biginds].T.dot(X[:, biginds]) + lam * np.eye(len(biginds)), X[:, biginds].T.dot(y),
-                                rcond=None)[0]
-            # print('cutsmallinds', w)
+            w[biginds] = np.linalg.lstsq(
+                X[:, biginds].T @ X[:, biginds] + lam * np.eye(len(biginds)),
+                X[:, biginds].T @ y, rcond=None)[0]
         else:
             w[biginds] = np.linalg.lstsq(X[:, biginds], y, rcond=None)[0]
 
-            # Apply sign constraints
+        # Optional sign constraints
         if sign_constraints is not None:
             for idx in biginds:
                 if idx in sign_constraints:
-                    # Ensure the coefficient has the correct sign
-                    if w[idx] > 0 and sign_constraints[idx] < 0:
-                        w[idx] = -w[idx]
-                    elif w[idx] < 0 and sign_constraints[idx] > 0:
-                        w[idx] = -w[idx]
+                    desired_sign = sign_constraints[idx]
+                    if w[idx] * desired_sign < 0:
+                        w[idx] *= -1
 
-
-    # Now that we have the sparsity pattern, use standard least squares to get w
-    if len(biginds) > 0:  # Check if biginds is not empty
-        w[biginds, :] = np.linalg.lstsq(X[:, biginds], y.squeeze(), rcond=None)[0].reshape(-1, 1)  # 转换为二维数组
+    # Final least-squares refit on the support
+    if len(biginds) > 0:
+        w[biginds, :] = np.linalg.lstsq(X[:, biginds], y.squeeze(), rcond=None)[0].reshape(-1, 1)
     else:
         print("No relevant features left after thresholding.")
 
+    # De-normalise
     if normalize != 0:
-        return np.multiply(Mreg, w)
+        return Mreg * w
     else:
         return w
 
-def evaluation(Y_true, Y_predict):
-    MSE = mean_squared_error(Y_true, Y_predict)
-    MAE = mean_absolute_error(Y_true, Y_predict)
-    RMSE = MSE ** 0.5
-    MAPE = np.mean(np.abs((Y_predict - Y_true) / Y_true)) * 100
 
-    y_true = Y_true.flatten() if len(Y_true.shape) > 1 else Y_true.squeeze()
-    y_predict = Y_predict.flatten() if len(Y_predict.shape) > 1 else Y_predict.squeeze()
-    R, p_value = pearsonr(y_true, y_predict)
+# --------------------------------------------------------------------------- #
+#                        Evaluation and I/O utilities                         #
+# --------------------------------------------------------------------------- #
+
+def evaluation(Y_true, Y_predict):
+    """
+    Compute regression metrics.
+
+    Returns
+    -------
+    MSE, MAE, RMSE, MAPE, R, R2 : float
+    """
+    MSE  = mean_squared_error(Y_true, Y_predict)
+    MAE  = mean_absolute_error(Y_true, Y_predict)
+    RMSE = np.sqrt(MSE)
+    MAPE = np.mean(np.abs((Y_predict - Y_true) / Y_true)) * 100
+    y_true    = Y_true.ravel()
+    y_predict = Y_predict.ravel()
+    R, _ = pearsonr(y_true, y_predict)
     R2 = r2_score(Y_true, Y_predict)
     return MSE, MAE, RMSE, MAPE, R, R2
 
-def SINDy(func_library, Y_ln, lam, dtol, maxit, func_name, x_max, y_max, savename, save_result):
 
-     w_best, trainR, valR, trainY, valY, err_, tol_best = TrainSTRidge(func_library, Y_ln, lam, dtol, maxit, STR_iters=10,
-                                                        l0_penalty=None,
-                                                        normalize=2, split=0.8, print_best_tol=True)
+# --------------------------------------------------------------------------- #
+#                         Main SINDy wrapper                                  #
+# --------------------------------------------------------------------------- #
 
-     # print('w_best:', w_best)
+def SINDy(func_library, Y_ln, lam, dtol, maxit, func_name, x_max, y_max,
+          savename, save_result):
+    """
+    Run the full SINDy pipeline: STRidge → coefficient rescaling → equation export.
 
-     w_final_np = np.array([float(w_best[x][0])/x_max[x]*y_max[0] for x in range(len(w_best))])
+    Parameters
+    ----------
+    func_library : ndarray
+        Normalised library matrix.
+    Y_ln : ndarray
+        Normalised target vector.
+    lam, dtol, maxit : float, float, int
+        STRidge hyper-parameters.
+    func_name : list[str]
+        Human-readable names of the library terms.
+    x_max, y_max : ndarray
+        Maxima used for rescaling.
+    savename : str
+        Prefix for output files.
+    save_result : bool
+        Whether to write the discovered equation to disk.
 
-     if save_result is True:
-         result_dir = 'result'
-         if not os.path.exists(result_dir):
-             os.makedirs(result_dir)
+    Returns
+    -------
+    w_final_np : ndarray
+        Rescaled coefficients.
+    equ : str
+        Discovered equation string.
+    """
+    w_best, _, _, _, _, _, _ = TrainSTRidge(
+        func_library, Y_ln, lam, dtol, maxit,
+        STR_iters=10, l0_penalty=None, normalize=2, split=0.8, print_best_tol=True)
 
-         equ = equation(w_final_np, func_name)
-         with open('result/equation_'+str(savename) + '.txt', 'w',
-                   encoding='utf-8') as f:
-             f.write(equ)
-             maf_pre = []
-             symbols_list = symbols('logIa ac c Ia')
-             for i in range(len(input)):
-                 s = sympify(equ[6:])
-                 expr = s.subs([
-                     (symbols_list[0], input['logIa'].iloc[i]),
-                     (symbols_list[1], input['ac'].iloc[i]),
-                     (symbols_list[2], input['c'].iloc[i]),
-                     (symbols_list[4], input['Ia'].iloc[i]),
-                                ])
-                 expr_str = str(expr)
-                 result = float(eval(expr_str))
-                 maf_pre.append(result)
-             f.close()
-     return w_final_np, equ
+    # Rescale coefficients back to original units
+    w_final_np = np.array([float(w_best[i][0]) / x_max[i] * y_max[0]
+                           for i in range(len(w_best))])
+
+    if save_result:
+        result_dir = 'result'
+        os.makedirs(result_dir, exist_ok=True)
+
+        equ = equation(w_final_np, func_name)
+        with open(os.path.join(result_dir, f'equation_{savename}.txt'), 'w', encoding='utf-8') as f:
+            f.write(equ)
+
+        # Optional: symbolic evaluation for diagnostics (variables must exist in scope)
+        # ...
+
+    return w_final_np, equ
 
 
 def equation(w, func_name):
-    co = []
-    fuc = []
-    disc_eq_temp = []
-    for i in range(w.shape[0]):
-        if i < len(func_name):
-            if w[i] != 0:
-                co.append(format(w[i], '.4f'))
-                fuc.append(func_name[i])
-                disc_eq_temp.append(str(format(w[i], '.4f')) + '*' + func_name[i])
+    """
+    Build a human-readable equation from the sparse coefficients.
 
-    disc_eq = '+'.join(disc_eq_temp)
-    equ = 'MAF = ' + disc_eq
+    Parameters
+    ----------
+    w : ndarray
+        Coefficient vector.
+    func_name : list[str]
+        Corresponding feature names.
+
+    Returns
+    -------
+    equ : str
+        Equation string of the form "MAF = ...".
+    """
+    terms = []
+    for i in range(w.shape[0]):
+        if w[i] != 0:
+            terms.append(f"{w[i]:.4f}*{func_name[i]}")
+    equ = "MAF = " + " + ".join(terms)
     print(equ)
     return equ
 
 
-def get_function_lib(func_dict, input, output):
-    func_library = pd.DataFrame(index=input.index)
+# --------------------------------------------------------------------------- #
+#                     Function library construction                           #
+# --------------------------------------------------------------------------- #
+
+def get_function_lib(func_dict, input_df, output_df):
+    """
+    Build and normalise the library matrix.
+
+    Parameters
+    ----------
+    func_dict : list[str]
+        List of library terms (e.g., 'Ia', 'ac', 'Ia*ac', 'logIa').
+    input_df : pd.DataFrame
+        Raw input features.
+    output_df : pd.DataFrame
+        Raw target vector.
+
+    Returns
+    -------
+    funclib_norm : ndarray
+        Normalised library matrix (rows = samples, cols = features).
+    y_norm : ndarray
+        Normalised target vector.
+    x_max, y_max : ndarray
+        Maxima used for rescaling.
+    """
+    lib = pd.DataFrame(index=input_df.index)
+
+    # Parse each string in func_dict
     for op in func_dict:
         if '**' in op:
-            # Extract column name and operation
-            col_name, operation = op.split('**')
-            # Perform the operation and add new column to DataFrame
-            func_library[op] = input[col_name] ** int(operation)
+            col, power = op.split('**')
+            lib[op] = input_df[col] ** int(power)
         elif '*' in op:
-            # Extract column names
-            col1, col2 = op.split('*')
-            # Perform multiplication and add new column to DataFrame
-            func_library[op] = input[col1] * input[col2]
+            c1, c2 = op.split('*')
+            lib[op] = input_df[c1] * input_df[c2]
         elif '/' in op:
-            # Extract column names
-            col1, col2 = op.split('/')
-            # Perform multiplication and add new column to DataFrame
-            func_library[op] = input[col1] / input[col2]
-        elif 'log' in op:
-            # Extract the column name inside the parentheses
-            col_name = op[3:]
-            # Perform log operation and add new column to DataFrame
-            func_library[op] = np.log(input[col_name])
-        elif 'exp' in op:
-            col_name = op[3:]
-            func_library[op] = np.exp(input[col_name])
+            c1, c2 = op.split('/')
+            lib[op] = input_df[c1] / input_df[c2]
+        elif op.startswith('log'):
+            col = op[3:]
+            lib[op] = np.log(input_df[col])
+        elif op.startswith('exp'):
+            col = op[3:]
+            lib[op] = np.exp(input_df[col])
         elif op == 'constant':
-            func_library[op] = 0.5
-        elif 'sin(' in op and ')' in op:
-            col_name = op[4:-1]
-            func_library[op] = np.sin(input[col_name]*np.pi)
-        elif 'cos(' in op and ')' in op:
-            col_name = op[4:-1]
-            func_library[op] = np.cos(input[col_name]*np.pi)
-    print(func_library)
-    # 最终的函数库
-    func_lib_all = pd.concat([input, func_library], axis=1)
-    func_lib_all = np.array(func_lib_all, dtype=np.float64)
-    output = np.array(output, dtype=np.float64)
-    # 归一化
-    x_max = np.max(func_lib_all, axis=0)
-    funclib_norm = func_lib_all / x_max
-    y_max = np.max(output, axis=0)
-    y_norm = output / y_max
-    if np.isnan(funclib_norm).any() or np.isinf(funclib_norm).any():
-        print("矩阵中包含NaN或Inf值，无法进行SVD计算。")
-        funclib_norm = funclib_norm[~np.isnan(funclib_norm).any(axis=1)]
-        funclib_norm = funclib_norm[~np.isinf(funclib_norm).any(axis=1)]
+            lib[op] = 0.5
+        elif op.startswith('sin(') and op.endswith(')'):
+            col = op[4:-1]
+            lib[op] = np.sin(input_df[col] * np.pi)
+        elif op.startswith('cos(') and op.endswith(')'):
+            col = op[4:-1]
+            lib[op] = np.cos(input_df[col] * np.pi)
+        else:
+            # Direct feature name
+            lib[op] = input_df[op]
+
+    # Concatenate raw inputs and engineered terms
+    func_lib_all = pd.concat([input_df, lib], axis=1).astype(np.float64)
+    output_np = output_df.values.astype(np.float64)
+
+    # Normalise
+    x_max = func_lib_all.max(axis=0).values
+    funclib_norm = func_lib_all.values / x_max
+    y_max = output_np.max(axis=0)
+    y_norm = output_np / y_max
+
+    # Drop any NaN/Inf rows
+    mask = ~(np.isnan(funclib_norm).any(axis=1) | np.isinf(funclib_norm).any(axis=1))
+    funclib_norm = funclib_norm[mask]
+
     return funclib_norm, y_norm, x_max, y_max
 
 
+# --------------------------------------------------------------------------- #
+#                              Main execution                                 #
+# --------------------------------------------------------------------------- #
+
 if __name__ == "__main__":
     time_start = time.time()
-    data = pd.read_excel('dndata.xlsx', engine='openpyxl', sheet_name='Sheet1')
-    input = data[['logIa', 'ac', 'c', 'acbpga', 'Ia']]
-    new_name = ['logIa', 'ac', 'c', 'acbpga', 'Ia']
-    input.columns = new_name
-    output = data[['logDn']]
 
-    lam = 1e-7
-    tol = 3
-    iters = 1000
+    # Read data
+    data = pd.read_excel('dndatanew.xlsx', engine='openpyxl', sheet_name='Sheet1')
+    """
+    Feature glossary (units are implicit):
+    logIa      : natural logarithm of Arias intensity (Ia)
+    ac         : critical acceleration (ac)
+    c          : soil coefficient (c)
+    acbpga     : ratio ac / pga  (peak ground acceleration in denominator)
+    acbpga2    : (ac / pga) ** 2
+    acbpga3    : (ac / pga) ** 3
+    log1jacbpga: log(1 - ac / pga)
+    Ia         : Arias intensity (in original units)
+    """
+    input_df = data[['logIa', 'ac', 'c', 'acbpga', 'Ia']]
+    input_df.columns = ['logIa', 'ac', 'c', 'acbpga', 'Ia']
+    output_df = data[['logDn']]
+
+    # Hyper-parameters
+    lam     = 1e-7
+    tol     = 3
+    iters   = 1000
     savename = 'Dn'
     save_result = True
 
-
-    func_dict = ['logIa', 'ac', 'c', 'Ia']
-
+    # Build library terms
+    func_dict = ['logIa', 'ac', 'c', 'acbpga', 'Ia']
     custom_multiply_terms = {
         # 'Ia*ac': 'Ia*ac',
         # 'Ia*logpga': 'Ia*logpga',
@@ -283,44 +421,41 @@ if __name__ == "__main__":
         # 'pgv*ac': 'pgv*ac',
         # 'pgv*logIa': 'pgv*logIa',
         # 'ac*logpga': 'ac*logpga',
-        # # # 'ac*logpga': 'ac*logpga',
-        # # 'ac*logCAV': 'ac*logCAV',
-        # # 'pga*logCAV': 'pga*logCAV',
         # 'ac*pga': 'ac*pga',
         # 'pga/ac': 'pga/ac',
         # 'logpga/ac': 'logpga/ac',
         # 'ac/pgv': 'ac/pgv',
         # 'ac/logpga': 'ac/logpga',
     }
-    #
+
     for term in custom_multiply_terms:
         if term not in func_dict:
             func_dict.append(term)
 
-    funclib_norm, y_norm, x_max, y_max = get_function_lib(func_dict, input, output)
+    # Construct and normalise library
+    funclib_norm, y_norm, x_max, y_max = get_function_lib(func_dict, input_df, output_df)
 
-    w_final, equ = SINDy(funclib_norm, y_norm, lam, tol, iters, func_dict, x_max, y_max, savename, save_result=save_result)
+    # Discover equation
+    w_final, equ = SINDy(funclib_norm, y_norm, lam, tol, iters, func_dict,
+                         x_max, y_max, savename, save_result=save_result)
 
-    maf_pre = []
-    for i in range(len(input)):
-        s = sympify(equ[6:])
-        symbols_list = symbols(' '.join(new_name))  # 使用新的列名创建符号列表
-        expr = s.subs([(symbols_list[idx], input[col].iloc[i]) for idx, col in enumerate(new_name)])
-        expr_str = str(expr)
-        result = float(eval(expr_str))
-        maf_pre.append(result)
+    # Predict back in original units
+    preds = []
+    symbols_list = symbols(' '.join(input_df.columns))
+    for idx, row in input_df.iterrows():
+        expr = sympify(equ[6:])
+        subs = [(symbols_list[i], row[col]) for i, col in enumerate(input_df.columns)]
+        val = float(expr.subs(subs))
+        preds.append(val)
 
-    MSE, MAE, RMSE, MAPE, R, R2 = evaluation(np.array(output), np.array(maf_pre))
-    print('MSE:', MSE, 'RMSE:', RMSE, 'MAPE:', MAPE, 'R:', R, 'R2:', R2)
+    # Evaluate metrics
+    MSE, MAE, RMSE, MAPE, R, R2 = evaluation(output_df.values, np.array(preds))
+    print(f'MSE: {MSE}, RMSE: {RMSE}, MAPE: {MAPE}, R: {R}, R2: {R2}')
 
-    result_dir = 'result'
-    if not os.path.exists(result_dir):
-        os.makedirs(result_dir)
-    result_file = f'result/y_true_vs_pred{savename}.txt'
-    with open(result_file, 'w') as f:
-        f.write('True Area\tPredicted Area\n')
-        for i in range(len(output)):
-            true_value = output.iloc[i].values[0]
-            predicted_value = maf_pre[i]
-            f.write(f'{true_value:.4f}\t{predicted_value:.4f}\n')
-    print(f'Saved true vs predicted areas to {result_file}')
+    # Save predictions
+    os.makedirs('result', exist_ok=True)
+    with open(f'result/y_true_vs_pred{savename}.txt', 'w') as f:
+        f.write('True logDn\tPredicted logDn\n')
+        for true, pred in zip(output_df.values.ravel(), preds):
+            f.write(f'{true:.4f}\t{pred:.4f}\n')
+    print(f'Saved true vs predicted values to result/y_true_vs_pred{savename}.txt')
