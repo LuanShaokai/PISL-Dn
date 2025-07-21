@@ -22,7 +22,8 @@ Usage
 	 Set hyperparameters such as lam, tol, iters according to your needs.
 	Run the Code: Execute the script to perform symbolic regression and establish the relationship. The code will output the evaluation metrics and save the results.
 Data Description
-	Only a small portion of the seismic dataset is publicly available in this repository. You are encouraged to use your own seismic data for experimentation. The provided data is for demonstration purposes only.
+	The dataset provided in this repository includes seismic records from the Wenchuan, Ludian, and Lushan earthquakes. It contains four levels of critical acceleration (ac): 0.2g, 0.15g, 0.1g, and 0.05g.
+	Due to data confidentiality requirements, only the seismic ground motion parameters are provided — the station codes and exact locations are not disclosed..
 Example Output
 	The code will generate an equation representing the relationship between Newmark displacement and seismic parameters. It will also output evaluation metrics to assess the performance of the established relationship. Additionally, the true and predicted values will be saved in a text file for further analysis.
 Note
